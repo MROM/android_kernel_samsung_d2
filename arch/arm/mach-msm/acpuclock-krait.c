@@ -46,8 +46,13 @@
 
 #define SECCLKAGD		BIT(4)
 
+#define MAX_VDD_SC		1400000 /* uV */
+#define MIN_VDD_SC		 700000 /* uV */
+
 static DEFINE_MUTEX(driver_lock);
 static DEFINE_SPINLOCK(l2_lock);
+
+extern void reset_num_cpu_freqs(void);
 
 static struct drv_data {
 	struct acpu_level *acpu_freq_tbl;
@@ -59,6 +64,8 @@ static struct drv_data {
 	int boost_uv;
 	struct device *dev;
 } drv;
+
+struct acpu_level orig_drv[30];
 
 static unsigned long acpuclk_krait_get_rate(int cpu)
 {
@@ -519,6 +526,7 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 	vdd_data.vdd_dig  = calculate_vdd_dig(tgt);
 	vdd_data.vdd_core = calculate_vdd_core(tgt);
 	vdd_data.ua_core = tgt->ua_core;
+	//pr_alert("KRAIT SET RATE-%lu-%d-%d-%d-%d\n", tgt->speed.khz, vdd_data.vdd_mem, vdd_data.vdd_dig, vdd_data.vdd_core, vdd_data.ua_core);
 
 	/* Disable AVS before voltage switch */
 	if (reason == SETRATE_CPUFREQ && drv.scalable[cpu].avs_enabled) {
@@ -629,9 +637,8 @@ static void __cpuinit hfpll_init(struct scalable *sc,
 		writel_relaxed(drv.hfpll_data->droop_val,
 			       sc->hfpll_base + drv.hfpll_data->droop_offset);
 
-	/* Set an initial rate and enable the PLL. */
+	/* Set an initial PLL rate. */
 	hfpll_set_rate(sc, tgt_s);
-	hfpll_enable(sc, false);
 }
 
 static int __cpuinit rpm_regulator_init(struct scalable *sc, enum vregs vreg,
@@ -802,7 +809,9 @@ static int __cpuinit init_clock_sources(struct scalable *sc,
 	regval &= ~(0x3 << 6);
 	set_l2_indirect_reg(sc->l2cpmr_iaddr, regval);
 
-	/* Switch to the target clock source. */
+	/* Enable and switch to the target clock source. */
+	if (tgt_s->src == HFPLL)
+		hfpll_enable(sc, false);
 	set_pri_clk_src(sc, tgt_s->pri_src_sel);
 	sc->cur_speed = tgt_s;
 
@@ -926,9 +935,9 @@ static void __init bus_init(const struct l2_level *l2_level)
 }
 
 #ifdef CONFIG_CPU_FREQ_MSM
-static struct cpufreq_frequency_table freq_table[NR_CPUS][35];
+static struct cpufreq_frequency_table freq_table[NR_CPUS][38];
 
-static void __init cpufreq_table_init(void)
+void cpufreq_table_init(void)
 {
 	int cpu;
 
@@ -942,6 +951,7 @@ static void __init cpufreq_table_init(void)
 				freq_table[cpu][freq_cnt].frequency
 					= drv.acpu_freq_tbl[i].speed.khz;
 				freq_cnt++;
+				//pr_alert("TABLE INIT-%lu-%d\n", drv.acpu_freq_tbl[i].speed.khz, drv.acpu_freq_tbl[i].vdd_core);
 			}
 		}
 		/* freq_table not big enough to store all usable freqs. */
@@ -961,15 +971,17 @@ static void __init cpufreq_table_init(void)
 static void __init cpufreq_table_init(void) {}
 #endif
 
-static void __init dcvs_freq_init(void)
+void dcvs_freq_init(void)
 {
 	int i;
+	reset_num_cpu_freqs();
 
 	for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0; i++)
+	{
+		orig_drv[i].vdd_core = drv.acpu_freq_tbl[i].vdd_core;
 		if (drv.acpu_freq_tbl[i].use_for_scaling)
-			msm_dcvs_register_cpu_freq(
-				drv.acpu_freq_tbl[i].speed.khz,
-				drv.acpu_freq_tbl[i].vdd_core / 1000);
+			msm_dcvs_register_cpu_freq(drv.acpu_freq_tbl[i].speed.khz, drv.acpu_freq_tbl[i].vdd_core / 1000);
+	}
 }
 
 static int __cpuinit acpuclk_cpu_callback(struct notifier_block *nfb,
@@ -1014,7 +1026,7 @@ static struct notifier_block __cpuinitdata acpuclk_cpu_notifier = {
 	.notifier_call = acpuclk_cpu_callback,
 };
 
-static const int krait_needs_vmin(void)
+static const int __init krait_needs_vmin(void)
 {
 	switch (read_cpuid_id()) {
 	case 0x511F04D0: /* KR28M2A20 */
@@ -1026,11 +1038,11 @@ static const int krait_needs_vmin(void)
 	};
 }
 
-static void krait_apply_vmin(struct acpu_level *tbl)
+static void __init krait_apply_vmin(struct acpu_level *tbl)
 {
 	for (; tbl->speed.khz != 0; tbl++) {
-		if (tbl->vdd_core < 1150000)
-			tbl->vdd_core = 1150000;
+		if (tbl->vdd_core < MIN_VDD_SC)
+			tbl->vdd_core = MIN_VDD_SC;
 		tbl->avsdscr_setting = 0;
 	}
 }
@@ -1123,11 +1135,90 @@ static void __init drv_data_init(struct device *dev,
 	BUG_ON(!pvs->table);
 
 	drv.acpu_freq_tbl = kmemdup(pvs->table, pvs->size, GFP_KERNEL);
+	
 	BUG_ON(!drv.acpu_freq_tbl);
 	drv.boost_uv = pvs->boost_uv;
 
 	acpuclk_krait_data.power_collapse_khz = params->stby_khz;
 	acpuclk_krait_data.wait_for_irq_khz = params->stby_khz;
+}
+
+void acpuclk_UV_mV_table(int cnt, int vdd_uv[]) {
+
+	int i;
+	int j=0;
+
+	reset_num_cpu_freqs();
+	if (vdd_uv[0] < vdd_uv[cnt-1])
+	{
+		for (i = 0; i < cnt; i++) {
+		    if ((vdd_uv[i]*1000) >= MIN_VDD_SC && (vdd_uv[i]*1000) <= MAX_VDD_SC)
+			drv.acpu_freq_tbl[i].vdd_core = vdd_uv[i]*1000;
+			msm_dcvs_register_cpu_freq(drv.acpu_freq_tbl[i].speed.khz, drv.acpu_freq_tbl[i].vdd_core / 1000);
+		}
+	}
+	else
+	{
+		j = cnt-1;
+		for (i = 0; i < cnt; i++) {
+		    if ((vdd_uv[j]*1000) >= MIN_VDD_SC && (vdd_uv[j]*1000) <= MAX_VDD_SC)
+		    {
+			drv.acpu_freq_tbl[i].vdd_core = vdd_uv[j]*1000;
+			msm_dcvs_register_cpu_freq(drv.acpu_freq_tbl[i].speed.khz, drv.acpu_freq_tbl[i].vdd_core / 1000);
+		    }
+		    j--;
+		}
+	}
+}
+
+ssize_t acpuclk_get_vdd_levels_str(char *buf, int isApp) {
+
+	int i, len = 0;
+
+	if (buf) {
+		if (isApp == 0)
+		{
+			//for (i = 0; acpu_freq_tbl[i+1].speed.khz; i++)
+			for (i = 0; i < isApp-1; i++)
+				len += sprintf(buf + len, "%lu: %d\n", drv.acpu_freq_tbl[i].speed.khz, drv.acpu_freq_tbl[i].vdd_core );
+		}
+		else
+		{
+			for (i = isApp-1; i >= 0; i--)
+				len += sprintf(buf + len, "%lumhz: %d mV\n", drv.acpu_freq_tbl[i].speed.khz/1000, drv.acpu_freq_tbl[i].vdd_core/1000);
+		}
+	}
+	return len;
+}
+
+ssize_t acpuclk_get_vdd_levels_str_stock(char *buf, int isApp) {
+	int i, len = 0;
+
+	if (buf) {
+		if (isApp == 0)
+		{
+			//for (i = 0; acpu_freq_tbl[i+1].speed.khz; i++)
+			for (i = 0; i < isApp-1; i++)
+				len += sprintf(buf + len, "%lu: %d\n", drv.acpu_freq_tbl[i].speed.khz, orig_drv[i].vdd_core );
+		}
+		else
+		{
+			for (i = isApp-1; i >= 0; i--)
+				len += sprintf(buf + len, "%lumhz: %d mV\n", drv.acpu_freq_tbl[i].speed.khz/1000, orig_drv[i].vdd_core/1000);
+		}
+	}
+	return len;
+}
+
+int get_the_freq_table(int cnt, int steps[]) {
+	int real_cnt=FREQ_STEPS;
+	int i= 0;
+	if (drv.acpu_freq_tbl == NULL)
+		return 0;
+	for (i = 0; i < real_cnt; i++) {
+		steps[i] = drv.acpu_freq_tbl[i].speed.khz;
+	}
+	return real_cnt;
 }
 
 static void __init hw_init(void)
@@ -1170,7 +1261,7 @@ static void __init hw_init(void)
 	bus_init(l2_level);
 }
 
-int __init acpuclk_krait_init(struct device *dev,
+int __cpuinit acpuclk_krait_init(struct device *dev,
 			      const struct acpuclk_krait_params *params)
 {
 	drv_data_init(dev, params);

@@ -70,7 +70,9 @@ extern unsigned int system_rev;
 #define PRESS_BIT_MASK		0X08
 #define KEYCODE_BIT_MASK	0X07
 
-#define TOUCHKEY_LOG(k, v) dev_notice(&info->client->dev, "key[%d] %d\n", k, v);
+#if defined(SEC_TOUCHKEY_DEBUG)
+	#define TOUCHKEY_LOG(k, v) dev_notice(&info->client->dev, "key[%d] %d\n", k, v);
+#endif
 #define FUNC_CALLED dev_notice(&info->client->dev, "%s: called.\n", __func__);
 
 #define NUM_OF_RETRY_UPDATE	3
@@ -184,6 +186,13 @@ static ssize_t brightness_level_show(struct device *dev,
 	return count;
 }
 
+extern void boostpulse_relay_kt(void);
+static bool kt_is_active_benabled = false;
+void kt_is_active_benabled_touchkey(bool val)
+{
+	kt_is_active_benabled = val;
+}
+
 static irqreturn_t cypress_touchkey_interrupt(int irq, void *dev_id)
 {
 	struct cypress_touchkey_info *info = dev_id;
@@ -234,7 +243,11 @@ static irqreturn_t cypress_touchkey_interrupt(int irq, void *dev_id)
 #if defined(SEC_TOUCHKEY_DEBUG)
 	TOUCHKEY_LOG(info->keycode[code], press);
 #endif
-
+	if (kt_is_active_benabled && press == 1 && (info->keycode[code] == 158 || info->keycode[code] == 139))
+	{
+		boostpulse_relay_kt();
+		//pr_alert("KEY_PRESS: %d-%d\n", info->keycode[code], press);
+	}
 	if (touch_is_pressed && press) {
 		printk(KERN_ERR "[TouchKey] don't send event because touch is pressed.\n");
 		printk(KERN_ERR "[TouchKey] touch_pressed = %d\n",
@@ -282,9 +295,9 @@ static int cypress_touchkey_auto_cal(struct cypress_touchkey_info *dev_info)
 
 		count = i2c_smbus_write_i2c_block_data(info->client,
 				CYPRESS_GEN, 4, data);
-		printk(KERN_DEBUG
-				"[TouchKey] data[0]=%x data[1]=%x data[2]=%x data[3]=%x\n",
-				data[0], data[1], data[2], data[3]);
+		//printk(KERN_DEBUG
+		//		"[TouchKey] data[0]=%x data[1]=%x data[2]=%x data[3]=%x\n",
+		//		data[0], data[1], data[2], data[3]);
 
 		msleep(50);
 

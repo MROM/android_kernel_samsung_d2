@@ -26,6 +26,7 @@
 #include <linux/compiler.h>
 #include <linux/blktrace_api.h>
 #include <linux/hrtimer.h>
+#include "kt_save_sched.h"
 
 /*
  * enum row_queue_prio - Priorities of the ROW queues
@@ -86,18 +87,18 @@ struct row_queue_params {
  */
 static const struct row_queue_params row_queues_def[] = {
 /* idling_enabled, quantum, is_urgent */
-	{true, 10, true},	/* ROWQ_PRIO_HIGH_READ */
-	{false, 1, false},	/* ROWQ_PRIO_HIGH_SWRITE */
-	{true, 100, true},	/* ROWQ_PRIO_REG_READ */
-	{false, 1, false},	/* ROWQ_PRIO_REG_SWRITE */
-	{false, 1, false},	/* ROWQ_PRIO_REG_WRITE */
-	{false, 1, false},	/* ROWQ_PRIO_LOW_READ */
-	{false, 1, false}	/* ROWQ_PRIO_LOW_SWRITE */
+	{true, 100, true},	/* ROWQ_PRIO_HIGH_READ */
+	{false, 4, true},	/* ROWQ_PRIO_HIGH_SWRITE */
+	{true, 75, true},	/* ROWQ_PRIO_REG_READ */
+	{false, 3, false},	/* ROWQ_PRIO_REG_SWRITE */
+	{false, 3, false},	/* ROWQ_PRIO_REG_WRITE */
+	{false, 3, false},	/* ROWQ_PRIO_LOW_READ */
+	{false, 2, false}	/* ROWQ_PRIO_LOW_SWRITE */
 };
 
 /* Default values for idling on read queues (in msec) */
-#define ROW_IDLE_TIME_MSEC 5
-#define ROW_READ_FREQ_MSEC 20
+#define ROW_IDLE_TIME_MSEC 10
+#define ROW_READ_FREQ_MSEC 25
 
 /**
  * struct rowq_idling_data -  parameters for idling on the queue
@@ -791,9 +792,18 @@ static void *row_init_queue(struct request_queue *q)
 		return NULL;
 
 	memset(rdata, 0, sizeof(*rdata));
+	load_prev_screen_on = isload_prev_screen_on();
 	for (i = 0; i < ROWQ_MAX_PRIO; i++) {
 		INIT_LIST_HEAD(&rdata->row_queues[i].fifo);
-		rdata->row_queues[i].disp_quantum = row_queues_def[i].quantum;
+		if (load_prev_screen_on == 2)
+			rdata->row_queues[i].disp_quantum = gsched_vars[i];
+		else
+		{
+			rdata->row_queues[i].disp_quantum = row_queues_def[i].quantum;
+			if (load_prev_screen_on == 0)
+				gsched_vars[i] = row_queues_def[i].quantum;
+		}
+		//pr_alert("ROW_INIT: %d-%d\n", i, gsched_vars[i]);
 		rdata->row_queues[i].rdata = rdata;
 		rdata->row_queues[i].prio = i;
 		rdata->row_queues[i].idle_data.begin_idling = false;
@@ -801,17 +811,38 @@ static void *row_init_queue(struct request_queue *q)
 			ktime_set(0, 0);
 	}
 
-	rdata->reg_prio_starvation.starvation_limit =
-			ROW_REG_STARVATION_TOLLERANCE;
-	rdata->low_prio_starvation.starvation_limit =
-			ROW_LOW_STARVATION_TOLLERANCE;
 	/*
 	 * Currently idling is enabled only for READ queues. If we want to
 	 * enable it for write queues also, note that idling frequency will
 	 * be the same in both cases
 	 */
-	rdata->rd_idle_data.idle_time_ms = ROW_IDLE_TIME_MSEC;
-	rdata->rd_idle_data.freq_ms = ROW_READ_FREQ_MSEC;
+	if (load_prev_screen_on == 2)
+	{
+		rdata->reg_prio_starvation.starvation_limit =
+				gsched_vars[9];
+		rdata->low_prio_starvation.starvation_limit =
+				gsched_vars[10];
+		rdata->rd_idle_data.idle_time_ms = gsched_vars[7];
+	}
+	else
+	{
+		rdata->reg_prio_starvation.starvation_limit =
+				ROW_REG_STARVATION_TOLLERANCE;
+		rdata->low_prio_starvation.starvation_limit =
+				ROW_LOW_STARVATION_TOLLERANCE;
+
+		rdata->rd_idle_data.idle_time_ms = ROW_IDLE_TIME_MSEC;
+		if (load_prev_screen_on == 0)
+			gsched_vars[7] = msecs_to_jiffies(ROW_IDLE_TIME_MSEC);
+	}
+	if (load_prev_screen_on == 2)
+		rdata->rd_idle_data.freq_ms = gsched_vars[8];
+	else
+	{
+		rdata->rd_idle_data.freq_ms = ROW_READ_FREQ_MSEC;
+		if (load_prev_screen_on == 0)
+			gsched_vars[8] = ROW_READ_FREQ_MSEC;
+	}
 	hrtimer_init(&rdata->rd_idle_data.hr_timer,
 		CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	rdata->rd_idle_data.hr_timer.function = &row_idle_hrtimer_fn;
@@ -820,6 +851,8 @@ static void *row_init_queue(struct request_queue *q)
 	rdata->last_served_ioprio_class = IOPRIO_CLASS_NONE;
 	rdata->rd_idle_data.idling_queue_idx = ROWQ_MAX_PRIO;
 	rdata->dispatch_queue = q;
+
+	rdata->nr_reqs[READ] = rdata->nr_reqs[WRITE] = 0;
 
 	return rdata;
 }
@@ -983,7 +1016,7 @@ SHOW_FUNCTION(row_low_starv_limit_show,
 	rowd->low_prio_starvation.starvation_limit);
 #undef SHOW_FUNCTION
 
-#define STORE_FUNCTION(__FUNC, __PTR, MIN, MAX)			\
+#define STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, NDX)		\
 static ssize_t __FUNC(struct elevator_queue *e,				\
 		const char *page, size_t count)				\
 {									\
@@ -995,38 +1028,39 @@ static ssize_t __FUNC(struct elevator_queue *e,				\
 	else if (__data > (MAX))					\
 		__data = (MAX);						\
 	*(__PTR) = __data;						\
+	gsched_vars[NDX] = __data;					\
 	return ret;							\
 }
 STORE_FUNCTION(row_hp_read_quantum_store,
-&rowd->row_queues[ROWQ_PRIO_HIGH_READ].disp_quantum, 1, INT_MAX);
+&rowd->row_queues[ROWQ_PRIO_HIGH_READ].disp_quantum, 1, INT_MAX, 0);
 STORE_FUNCTION(row_rp_read_quantum_store,
 			&rowd->row_queues[ROWQ_PRIO_REG_READ].disp_quantum,
-			1, INT_MAX);
+			1, INT_MAX, 1);
 STORE_FUNCTION(row_hp_swrite_quantum_store,
 			&rowd->row_queues[ROWQ_PRIO_HIGH_SWRITE].disp_quantum,
-			1, INT_MAX);
+			1, INT_MAX, 2);
 STORE_FUNCTION(row_rp_swrite_quantum_store,
 			&rowd->row_queues[ROWQ_PRIO_REG_SWRITE].disp_quantum,
-			1, INT_MAX);
+			1, INT_MAX, 3);
 STORE_FUNCTION(row_rp_write_quantum_store,
 			&rowd->row_queues[ROWQ_PRIO_REG_WRITE].disp_quantum,
-			1, INT_MAX);
+			1, INT_MAX, 4);
 STORE_FUNCTION(row_lp_read_quantum_store,
 			&rowd->row_queues[ROWQ_PRIO_LOW_READ].disp_quantum,
-			1, INT_MAX);
+			1, INT_MAX, 5);
 STORE_FUNCTION(row_lp_swrite_quantum_store,
 			&rowd->row_queues[ROWQ_PRIO_LOW_SWRITE].disp_quantum,
-			1, INT_MAX);
+			1, INT_MAX, 6);
 STORE_FUNCTION(row_rd_idle_data_store, &rowd->rd_idle_data.idle_time_ms,
-			1, INT_MAX);
+			1, INT_MAX, 7);
 STORE_FUNCTION(row_rd_idle_data_freq_store, &rowd->rd_idle_data.freq_ms,
-			1, INT_MAX);
+			1, INT_MAX, 8);
 STORE_FUNCTION(row_reg_starv_limit_store,
 			&rowd->reg_prio_starvation.starvation_limit,
-			1, INT_MAX);
+			1, INT_MAX, 9);
 STORE_FUNCTION(row_low_starv_limit_store,
 			&rowd->low_prio_starvation.starvation_limit,
-			1, INT_MAX);
+			1, INT_MAX, 10);
 
 #undef STORE_FUNCTION
 

@@ -53,8 +53,8 @@ static int msm_thermal_get_freq_table(void)
 	while (table[i].frequency != CPUFREQ_TABLE_END)
 		i++;
 
-	limit_idx_low = 0;
-	limit_idx_high = limit_idx = i - 1;
+	limit_idx_low = 3;
+	limit_idx_high = limit_idx = i - 7;
 	BUG_ON(limit_idx_high <= 0 || limit_idx_high <= limit_idx_low);
 fail:
 	return ret;
@@ -63,7 +63,9 @@ fail:
 static int update_cpu_max_freq(int cpu, uint32_t max_freq)
 {
 	int ret = 0;
-
+	
+	if (max_freq > 1512000) max_freq = 1512000;
+	
 	ret = msm_cpufreq_set_freq_limits(cpu, MSM_CPUFREQ_NO_LIMIT, max_freq);
 	if (ret)
 		return ret;
