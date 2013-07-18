@@ -2838,25 +2838,25 @@ int mgmt_powered(u16 index, u8 powered)
 	return ret;
 }
 
-int mgmt_set_powered_failed(struct hci_dev *hdev, int err)
+int mgmt_set_powered_failed(u16 index, int err)
 {
-       struct pending_cmd *cmd;
-       u8 status;
+	struct pending_cmd *cmd;
+	u8 status;
 
-       cmd = mgmt_pending_find(MGMT_OP_SET_POWERED, hdev->id);
-       if (!cmd)
-               return -ENOENT;
+	cmd = mgmt_pending_find(MGMT_OP_SET_POWERED, index);
+	if (!cmd)
+		return -ENOENT;
 
-       if (err == -ERFKILL)
-               status = MGMT_STATUS_RFKILLED;
-       else
-               status = MGMT_STATUS_FAILED;
+	if (err == -ERFKILL)
+		status = MGMT_STATUS_RFKILLED;
+	else
+		status = MGMT_STATUS_FAILED;
 
-       err = cmd_status(cmd->sk, hdev->id, MGMT_OP_SET_POWERED, status);
+	err = cmd_status(cmd->sk, index, MGMT_OP_SET_POWERED, status);
 
-       mgmt_pending_remove(cmd);
+	mgmt_pending_remove(cmd);
 
-       return err;
+	return err;
 }
 
 int mgmt_discoverable(u16 index, u8 discoverable)
